@@ -7,6 +7,7 @@ A collection of tools and utilities developed in-house by the BI Engineering tea
 - **Display Options Utility**
 - **Project Assignment Swap**
 - **Project Assignment Migration**
+- **VsCode Extension for rdl file Data Set Update**
 
 ## Usage & Contribution Guidelines
 

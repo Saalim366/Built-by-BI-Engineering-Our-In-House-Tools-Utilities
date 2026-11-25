@@ -1,0 +1,2569 @@
+<?xml version='1.0' encoding='utf-8'?>
+<Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition" xmlns:rd="http://schemas.microsoft.com/SQLServer/reporting/reportdesigner">
+  <Description>Read-only current-company invoice-template assignment export. Excel contains only the assignment table, including Status. CSV contains only ProjectID, StandardTemplateName, JointTemplateName and ManualTemplateName; unassigned roles are blank. Restore accepts this CSV file only. Source issues block CSV assignment-data export. No permanent table or procedure required.</Description>
+  <Author>BQE CORE migration utility</Author>
+  <AutoRefresh>0</AutoRefresh>
+  <InitialPageName>Assignments</InitialPageName>
+  <DataSources>
+    <DataSource Name="BQE_GlobalDataSource">
+      <rd:SecurityType>None</rd:SecurityType>
+      <ConnectionProperties>
+        <DataProvider>SQL</DataProvider>
+        <ConnectString>=Parameters!pConnectionString.Value</ConnectString>
+      </ConnectionProperties>
+      <rd:DataSourceID>9e6ba015-06c9-44ab-925e-dba128bb3df4</rd:DataSourceID>
+    </DataSource>
+  </DataSources>
+  <DataSets>
+    <DataSet Name="dsExportAssignments">
+      <Query>
+        <DataSourceName>BQE_GlobalDataSource</DataSourceName>
+        <CommandText>/*
+PROJECT INVOICE TEMPLATE ASSIGNMENT EXPORT | SQL Server 2022
+Read-only against CORE. Run in the current company's PILOT database.
+The RDL embeds this exact query. No permanent table/procedure is required.
+Export the report directly to CSV for ProjectInvoiceTemplate_AssignmentRestore.sql.
+Excel is a table-only review export, not a restore input. No SQL data block is generated.
+NULL and the all-zero GUID both mean NOT ASSIGNED.
+*/
+SET NOCOUNT ON;
+IF @@TRANCOUNT &lt;&gt; 0
+BEGIN
+    RAISERROR('Run the export outside an existing transaction.', 16, 1);
+    RETURN;
+END;
+SET XACT_ABORT ON;
+IF DB_NAME() IN (N'master', N'model', N'msdb', N'tempdb')
+    THROW 51201, 'Connect the report to the current company database.', 1;
+IF OBJECT_ID(N'dbo.Project', N'U') IS NULL
+   OR OBJECT_ID(N'dbo.InvoiceTemplate', N'U') IS NULL
+    THROW 51202, 'The connected database does not contain the required CORE tables.', 1;
+
+DECLARE @Zero UNIQUEIDENTIFIER = '00000000-0000-0000-0000-000000000000';
+DECLARE @BackupID UNIQUEIDENTIFIER = NEWID();
+DECLARE @CapturedAtUtc DATETIME2(0);
+DECLARE @DatabaseName NVARCHAR(128) = DB_NAME();
+
+DROP TABLE IF EXISTS #PEProjects;
+DROP TABLE IF EXISTS #PETemplates;
+DROP TABLE IF EXISTS #PEProjectCounts;
+DROP TABLE IF EXISTS #PETemplateIDCounts;
+DROP TABLE IF EXISTS #PETemplateNameCounts;
+DROP TABLE IF EXISTS #PECandidates;
+DROP TABLE IF EXISTS #PESlots;
+DROP TABLE IF EXISTS #PEIssues;
+DROP TABLE IF EXISTS #PESnapshot;
+DROP TABLE IF EXISTS #PEOutput;
+
+-- Hold source reads only while taking the two-table snapshot.
+BEGIN TRY
+    BEGIN TRANSACTION;
+    SELECT IDENTITY(INT, 1, 1) AS SourceRowNo, P.Project_ID,
+           CONVERT(NVARCHAR(MAX), P.ProjectID) COLLATE DATABASE_DEFAULT AS ProjectID,
+           NULLIF(P.StandardInvoiceTemplate_ID, @Zero) AS StandardInvoiceTemplate_ID,
+           NULLIF(P.JointInvoiceTemplate_ID, @Zero) AS JointInvoiceTemplate_ID,
+           NULLIF(P.ManualInvoiceTemplate_ID, @Zero) AS ManualInvoiceTemplate_ID
+    INTO #PEProjects FROM dbo.Project AS P WITH (HOLDLOCK);
+
+    SELECT T.InvoiceTemplate_ID,
+           CONVERT(NVARCHAR(MAX), T.Name) COLLATE DATABASE_DEFAULT AS TemplateName
+    INTO #PETemplates FROM dbo.InvoiceTemplate AS T WITH (HOLDLOCK)
+    WHERE T.InvoiceTemplate_ID &lt;&gt; @Zero;
+    SET @CapturedAtUtc = SYSUTCDATETIME();
+    COMMIT TRANSACTION;
+END TRY
+BEGIN CATCH
+    IF XACT_STATE() &lt;&gt; 0 ROLLBACK TRANSACTION;
+    THROW;
+END CATCH;
+
+CREATE INDEX IX_PE_TemplateID ON #PETemplates (InvoiceTemplate_ID);
+SELECT ProjectID, COUNT_BIG(*) AS MatchCount
+INTO #PEProjectCounts FROM #PEProjects GROUP BY ProjectID;
+SELECT InvoiceTemplate_ID, COUNT_BIG(*) AS MatchCount
+INTO #PETemplateIDCounts FROM #PETemplates GROUP BY InvoiceTemplate_ID;
+SELECT TemplateName, COUNT_BIG(*) AS MatchCount
+INTO #PETemplateNameCounts FROM #PETemplates GROUP BY TemplateName;
+
+SELECT P.*, C.MatchCount AS ProjectMatchCount
+INTO #PECandidates FROM #PEProjects AS P
+LEFT JOIN #PEProjectCounts AS C ON C.ProjectID = P.ProjectID
+WHERE P.StandardInvoiceTemplate_ID IS NOT NULL
+   OR P.JointInvoiceTemplate_ID IS NOT NULL
+   OR P.ManualInvoiceTemplate_ID IS NOT NULL;
+
+CREATE TABLE #PEIssues (
+    SourceRowNo INT NOT NULL,
+    ProjectID NVARCHAR(MAX) COLLATE DATABASE_DEFAULT NULL,
+    TemplateRole NVARCHAR(10) NOT NULL,
+    TemplateName NVARCHAR(MAX) COLLATE DATABASE_DEFAULT NULL,
+    IssueMessage NVARCHAR(300) NOT NULL
+);
+INSERT #PEIssues (SourceRowNo, ProjectID, TemplateRole, IssueMessage)
+SELECT SourceRowNo, ProjectID, N'Project',
+       CASE WHEN NULLIF(LTRIM(RTRIM(ProjectID)), N'') IS NULL THEN N'Project ID is missing or blank.'
+            WHEN DATALENGTH(ProjectID) &gt; 8000 THEN N'Project ID exceeds 4000 Unicode code units.'
+            ELSE N'Project ID is duplicated. It cannot uniquely identify a project after migration.' END
+FROM #PECandidates
+WHERE NULLIF(LTRIM(RTRIM(ProjectID)), N'') IS NULL
+   OR DATALENGTH(ProjectID) &gt; 8000 OR ProjectMatchCount &lt;&gt; 1;
+
+SELECT P.SourceRowNo, P.ProjectID, V.TemplateRole, V.AssignedTemplate_ID, T.TemplateName,
+       CONVERT(NVARCHAR(300), CASE
+           WHEN V.AssignedTemplate_ID IS NULL THEN NULL
+           WHEN ISNULL(IC.MatchCount, 0) = 0 THEN N'Assigned template ID does not exist in InvoiceTemplate.'
+           WHEN IC.MatchCount &gt; 1 THEN N'Assigned template ID matches more than one record.'
+           WHEN NULLIF(LTRIM(RTRIM(T.TemplateName)), N'') IS NULL THEN N'Assigned template name is missing or blank.'
+           WHEN DATALENGTH(T.TemplateName) &gt; 8000 THEN N'Template name exceeds 4000 Unicode code units.'
+           WHEN NC.MatchCount &gt; 1 THEN N'Template name is duplicated. It cannot uniquely identify a template after migration.'
+           ELSE NULL END) AS IssueMessage
+INTO #PESlots FROM #PECandidates AS P
+CROSS APPLY (VALUES
+    (N'Standard', P.StandardInvoiceTemplate_ID),
+    (N'Joint', P.JointInvoiceTemplate_ID),
+    (N'Manual', P.ManualInvoiceTemplate_ID)
+) AS V(TemplateRole, AssignedTemplate_ID)
+LEFT JOIN #PETemplateIDCounts AS IC ON IC.InvoiceTemplate_ID = V.AssignedTemplate_ID
+OUTER APPLY (
+    -- TOP (1) is only for displaying diagnostics; ambiguity always blocks export.
+    SELECT TOP (1) T0.TemplateName FROM #PETemplates AS T0
+    WHERE T0.InvoiceTemplate_ID = V.AssignedTemplate_ID ORDER BY T0.TemplateName
+) AS T
+LEFT JOIN #PETemplateNameCounts AS NC ON NC.TemplateName = T.TemplateName;
+CREATE INDEX IX_PE_Slots ON #PESlots (SourceRowNo, TemplateRole);
+INSERT #PEIssues
+SELECT SourceRowNo, ProjectID, TemplateRole, TemplateName, IssueMessage
+FROM #PESlots WHERE IssueMessage IS NOT NULL;
+CREATE INDEX IX_PE_Issues ON #PEIssues (SourceRowNo);
+
+SELECT CONVERT(INT, ROW_NUMBER() OVER (ORDER BY P.ProjectID, P.SourceRowNo)) AS RowNo,
+       P.SourceRowNo, P.ProjectID,
+       S.TemplateName AS StandardTemplateName, J.TemplateName AS JointTemplateName,
+       M.TemplateName AS ManualTemplateName
+INTO #PESnapshot FROM #PECandidates AS P
+INNER JOIN #PESlots AS S ON S.SourceRowNo = P.SourceRowNo AND S.TemplateRole = N'Standard'
+INNER JOIN #PESlots AS J ON J.SourceRowNo = P.SourceRowNo AND J.TemplateRole = N'Joint'
+INNER JOIN #PESlots AS M ON M.SourceRowNo = P.SourceRowNo AND M.TemplateRole = N'Manual';
+
+DECLARE @ProjectCount INT = (SELECT COUNT(*) FROM #PESnapshot);
+DECLARE @IssueCount INT = (SELECT COUNT(*) FROM #PEIssues);
+DECLARE @UnassignedProjectCount INT = (SELECT COUNT(*) FROM #PEProjects) - @ProjectCount;
+DECLARE @StandardCount INT = (SELECT COUNT(*) FROM #PESlots WHERE TemplateRole = N'Standard' AND AssignedTemplate_ID IS NOT NULL);
+DECLARE @JointCount INT = (SELECT COUNT(*) FROM #PESlots WHERE TemplateRole = N'Joint' AND AssignedTemplate_ID IS NOT NULL);
+DECLARE @ManualCount INT = (SELECT COUNT(*) FROM #PESlots WHERE TemplateRole = N'Manual' AND AssignedTemplate_ID IS NOT NULL);
+DECLARE @Status NVARCHAR(12) = CASE WHEN @IssueCount &gt; 0 THEN N'REVIEW' WHEN @ProjectCount = 0 THEN N'EMPTY' ELSE N'READY' END;
+DECLARE @Message NVARCHAR(500) = CASE
+    WHEN @IssueCount &gt; 0 THEN N'Backup not generated. Correct the issues listed below, then run the report again. No data has been changed.'
+    WHEN @ProjectCount = 0 THEN N'No invoice-template assignments were found. Nothing needs to be backed up. No data has been changed.'
+    ELSE N'Ready to export. Save the four-column CSV before migration and use that file with the restore script. Excel is for table-only review. No data has been changed.' END;
+
+CREATE TABLE #PEOutput (
+    RowKind NVARCHAR(10) NOT NULL, SortGroup INT NOT NULL, SortKey BIGINT NOT NULL,
+    ProjectID NVARCHAR(MAX) NULL, StandardTemplateName NVARCHAR(MAX) NULL,
+    JointTemplateName NVARCHAR(MAX) NULL, ManualTemplateName NVARCHAR(MAX) NULL,
+    RowStatus NVARCHAR(30) NULL, TemplateRole NVARCHAR(10) NULL,
+    IssueTemplateName NVARCHAR(MAX) NULL, RowMessage NVARCHAR(500) NULL
+);
+INSERT #PEOutput (RowKind, SortGroup, SortKey) VALUES (N'SUMMARY', 0, 0);
+INSERT #PEOutput (RowKind, SortGroup, SortKey, ProjectID, StandardTemplateName,
+                     JointTemplateName, ManualTemplateName, RowStatus)
+SELECT N'DETAIL', 1, S.RowNo, S.ProjectID,
+       CASE WHEN ST.AssignedTemplate_ID IS NOT NULL THEN ISNULL(NULLIF(S.StandardTemplateName, N''), N'[Missing template name]') ELSE NULL END,
+       CASE WHEN JT.AssignedTemplate_ID IS NOT NULL THEN ISNULL(NULLIF(S.JointTemplateName, N''), N'[Missing template name]') ELSE NULL END,
+       CASE WHEN MT.AssignedTemplate_ID IS NOT NULL THEN ISNULL(NULLIF(S.ManualTemplateName, N''), N'[Missing template name]') ELSE NULL END,
+       CASE WHEN EXISTS (SELECT 1 FROM #PEIssues AS I WHERE I.SourceRowNo = S.SourceRowNo) THEN N'Needs review' ELSE N'Valid' END
+FROM #PESnapshot AS S
+INNER JOIN #PESlots AS ST ON ST.SourceRowNo = S.SourceRowNo AND ST.TemplateRole = N'Standard'
+INNER JOIN #PESlots AS JT ON JT.SourceRowNo = S.SourceRowNo AND JT.TemplateRole = N'Joint'
+INNER JOIN #PESlots AS MT ON MT.SourceRowNo = S.SourceRowNo AND MT.TemplateRole = N'Manual';
+INSERT #PEOutput (RowKind, SortGroup, SortKey, ProjectID, TemplateRole, IssueTemplateName, RowMessage)
+SELECT N'ISSUE', 2, ROW_NUMBER() OVER (ORDER BY SourceRowNo, TemplateRole), ProjectID, TemplateRole, TemplateName, IssueMessage
+FROM #PEIssues;
+
+SELECT @DatabaseName AS DatabaseName, @CapturedAtUtc AS CapturedAtUtc,
+       CONVERT(NVARCHAR(36), @BackupID) AS BackupID, @Status AS ExportStatus, @Message AS ExportMessage,
+       @ProjectCount AS ProjectCount, @UnassignedProjectCount AS UnassignedProjectCount,
+       @StandardCount AS StandardCount, @JointCount AS JointCount, @ManualCount AS ManualCount,
+       @IssueCount AS IssueCount,
+       RowKind, SortKey, ProjectID, StandardTemplateName, JointTemplateName, ManualTemplateName,
+       RowStatus, TemplateRole, IssueTemplateName, RowMessage
+FROM #PEOutput ORDER BY SortGroup, SortKey;
+</CommandText>
+        <Timeout>180</Timeout>
+      </Query>
+      <Fields>
+        <Field Name="DatabaseName">
+          <DataField>DatabaseName</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="CapturedAtUtc">
+          <DataField>CapturedAtUtc</DataField>
+          <rd:TypeName>System.DateTime</rd:TypeName>
+        </Field>
+        <Field Name="BackupID">
+          <DataField>BackupID</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="ExportStatus">
+          <DataField>ExportStatus</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="ExportMessage">
+          <DataField>ExportMessage</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="ProjectCount">
+          <DataField>ProjectCount</DataField>
+          <rd:TypeName>System.Int32</rd:TypeName>
+        </Field>
+        <Field Name="UnassignedProjectCount">
+          <DataField>UnassignedProjectCount</DataField>
+          <rd:TypeName>System.Int32</rd:TypeName>
+        </Field>
+        <Field Name="StandardCount">
+          <DataField>StandardCount</DataField>
+          <rd:TypeName>System.Int32</rd:TypeName>
+        </Field>
+        <Field Name="JointCount">
+          <DataField>JointCount</DataField>
+          <rd:TypeName>System.Int32</rd:TypeName>
+        </Field>
+        <Field Name="ManualCount">
+          <DataField>ManualCount</DataField>
+          <rd:TypeName>System.Int32</rd:TypeName>
+        </Field>
+        <Field Name="IssueCount">
+          <DataField>IssueCount</DataField>
+          <rd:TypeName>System.Int32</rd:TypeName>
+        </Field>
+        <Field Name="RowKind">
+          <DataField>RowKind</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="SortKey">
+          <DataField>SortKey</DataField>
+          <rd:TypeName>System.Int64</rd:TypeName>
+        </Field>
+        <Field Name="ProjectID">
+          <DataField>ProjectID</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="StandardTemplateName">
+          <DataField>StandardTemplateName</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="JointTemplateName">
+          <DataField>JointTemplateName</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="ManualTemplateName">
+          <DataField>ManualTemplateName</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="RowStatus">
+          <DataField>RowStatus</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="TemplateRole">
+          <DataField>TemplateRole</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="IssueTemplateName">
+          <DataField>IssueTemplateName</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="RowMessage">
+          <DataField>RowMessage</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        </Fields>
+    </DataSet>
+  </DataSets>
+  <ReportSections>
+    <ReportSection>
+      <Body>
+        <ReportItems>
+          <Tablix Name="ExcelAssignments">
+                <TablixBody>
+                  <TablixColumns>
+                    <TablixColumn>
+                      <Width>1.45in</Width>
+                    </TablixColumn>
+                    <TablixColumn>
+                      <Width>2.65in</Width>
+                    </TablixColumn>
+                    <TablixColumn>
+                      <Width>2.65in</Width>
+                    </TablixColumn>
+                    <TablixColumn>
+                      <Width>2.65in</Width>
+                    </TablixColumn>
+                    <TablixColumn>
+                      <Width>1.2in</Width>
+                    </TablixColumn>
+                  </TablixColumns>
+                  <TablixRows>
+                    <TablixRow>
+                      <Height>0.36in</Height>
+                      <TablixCells>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="ExcelAssignments_Cell0_0">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>Project ID</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Bold</FontWeight>
+                                        <Color>White</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>#24485C</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="ExcelAssignments_Cell0_1">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>Standard template</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Bold</FontWeight>
+                                        <Color>White</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>#24485C</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="ExcelAssignments_Cell0_2">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>Joint template</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Bold</FontWeight>
+                                        <Color>White</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>#24485C</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="ExcelAssignments_Cell0_3">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>Manual template</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Bold</FontWeight>
+                                        <Color>White</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>#24485C</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="ExcelAssignments_Cell0_4">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>Status</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Bold</FontWeight>
+                                        <Color>White</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>#24485C</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                      </TablixCells>
+                    </TablixRow>
+                    <TablixRow>
+                      <Height>0.38in</Height>
+                      <TablixCells>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="ExcelAssignments_Cell1_0">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>=Fields!ProjectID.Value</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Normal</FontWeight>
+                                        <Color>#334155</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>=If(RowNumber("ExcelAssignments") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="ExcelAssignments_Cell1_1">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>=If(IsNothing(Fields!StandardTemplateName.Value), "Not assigned", Fields!StandardTemplateName.Value)</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Normal</FontWeight>
+                                        <Color>#334155</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>=If(RowNumber("ExcelAssignments") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="ExcelAssignments_Cell1_2">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>=If(IsNothing(Fields!JointTemplateName.Value), "Not assigned", Fields!JointTemplateName.Value)</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Normal</FontWeight>
+                                        <Color>#334155</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>=If(RowNumber("ExcelAssignments") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="ExcelAssignments_Cell1_3">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>=If(IsNothing(Fields!ManualTemplateName.Value), "Not assigned", Fields!ManualTemplateName.Value)</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Normal</FontWeight>
+                                        <Color>#334155</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>=If(RowNumber("ExcelAssignments") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="ExcelAssignments_Cell1_4">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>=Fields!RowStatus.Value</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Normal</FontWeight>
+                                        <Color>#334155</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>=If(RowNumber("ExcelAssignments") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                      </TablixCells>
+                    </TablixRow>
+                  </TablixRows>
+                </TablixBody>
+                <TablixColumnHierarchy>
+                  <TablixMembers>
+                    <TablixMember/>
+                    <TablixMember/>
+                    <TablixMember/>
+                    <TablixMember/>
+                    <TablixMember/>
+                  </TablixMembers>
+                </TablixColumnHierarchy>
+                <TablixRowHierarchy>
+                  <TablixMembers>
+                    <TablixMember>
+                      <KeepWithGroup>After</KeepWithGroup>
+                      <RepeatOnNewPage>true</RepeatOnNewPage>
+                      <FixedData>true</FixedData>
+                    </TablixMember>
+                    <TablixMember>
+                      <Group Name="ExcelAssignments_Details"/>
+                      <SortExpressions>
+                        <SortExpression>
+                          <Value>=Fields!SortKey.Value</Value>
+                        </SortExpression>
+                      </SortExpressions>
+                    </TablixMember>
+                  </TablixMembers>
+                </TablixRowHierarchy>
+                <DataSetName>dsExportAssignments</DataSetName>
+                <Filters>
+                  <Filter>
+                    <FilterExpression>=Fields!RowKind.Value</FilterExpression>
+                    <Operator>Equal</Operator>
+                    <FilterValues>
+                      <FilterValue>DETAIL</FilterValue>
+                    </FilterValues>
+                  </Filter>
+                </Filters>
+                <NoRowsMessage>No projects with invoice-template assignments were found.</NoRowsMessage>
+                <Top>0in</Top>
+                <Left>0in</Left>
+                <Height>0.740in</Height>
+                <Width>10.600in</Width>
+                <Style>
+                  <FontFamily>Arial</FontFamily>
+                  <FontSize>9pt</FontSize>
+                  <Color>#64748B</Color>
+                </Style>
+                <DataElementOutput>NoOutput</DataElementOutput>
+              <PageName>Assignments</PageName><Visibility><Hidden>=Not(Globals!RenderFormat.Name = "EXCELOPENXML" Or Globals!RenderFormat.Name = "EXCEL")</Hidden></Visibility></Tablix>
+              <Rectangle Name="AssignmentSection">
+            <ReportItems>
+              <Rectangle Name="HeaderPanel">
+                <ReportItems>
+                  <Textbox Name="Title">
+                    <CanGrow>true</CanGrow>
+                    <KeepTogether>true</KeepTogether>
+                    <Paragraphs>
+                      <Paragraph>
+                        <TextRuns>
+                          <TextRun>
+                            <Value>Project invoice template assignments</Value>
+                            <Style>
+                              <FontFamily>Arial</FontFamily>
+                              <FontSize>22pt</FontSize>
+                              <FontWeight>Bold</FontWeight>
+                              <Color>White</Color>
+                            </Style>
+                          </TextRun>
+                        </TextRuns>
+                        <Style>
+                          <TextAlign>Left</TextAlign>
+                        </Style>
+                      </Paragraph>
+                    </Paragraphs>
+                    <Top>0.13in</Top>
+                    <Left>0.2in</Left>
+                    <Height>0.34in</Height>
+                    <Width>10.15in</Width>
+                    <Style>
+                      <VerticalAlign>Middle</VerticalAlign>
+                      <PaddingLeft>0pt</PaddingLeft>
+                      <PaddingRight>0pt</PaddingRight>
+                      <PaddingTop>0pt</PaddingTop>
+                      <PaddingBottom>0pt</PaddingBottom>
+                    </Style>
+                    <DataElementOutput>NoOutput</DataElementOutput>
+                  </Textbox>
+                  <Textbox Name="Subtitle">
+                    <CanGrow>true</CanGrow>
+                    <KeepTogether>true</KeepTogether>
+                    <Paragraphs>
+                      <Paragraph>
+                        <TextRuns>
+                          <TextRun>
+                            <Value>BEFORE MIGRATION  /  Read-only backup of Standard, Joint and Manual assignments</Value>
+                            <Style>
+                              <FontFamily>Arial</FontFamily>
+                              <FontSize>9pt</FontSize>
+                              <FontWeight>Normal</FontWeight>
+                              <Color>#C8DCE8</Color>
+                            </Style>
+                          </TextRun>
+                        </TextRuns>
+                        <Style>
+                          <TextAlign>Left</TextAlign>
+                        </Style>
+                      </Paragraph>
+                    </Paragraphs>
+                    <Top>0.56in</Top>
+                    <Left>0.22in</Left>
+                    <Height>0.18in</Height>
+                    <Width>10.1in</Width>
+                    <Style>
+                      <VerticalAlign>Middle</VerticalAlign>
+                      <PaddingLeft>0pt</PaddingLeft>
+                      <PaddingRight>0pt</PaddingRight>
+                      <PaddingTop>0pt</PaddingTop>
+                      <PaddingBottom>0pt</PaddingBottom>
+                    </Style>
+                    <DataElementOutput>NoOutput</DataElementOutput>
+                  </Textbox>
+                </ReportItems>
+                <KeepTogether>false</KeepTogether>
+                <Top>0in</Top>
+                <Left>0in</Left>
+                <Height>0.9in</Height>
+                <Width>10.6in</Width>
+                <Style>
+                  <BackgroundColor>#132B43</BackgroundColor>
+                </Style>
+              </Rectangle>
+              <Textbox Name="Company">
+                <CanGrow>true</CanGrow>
+                <KeepTogether>true</KeepTogether>
+                <Paragraphs>
+                  <Paragraph>
+                    <TextRuns>
+                      <TextRun>
+                        <Value>="CURRENT COMPANY DATABASE  |  " &amp; First(Fields!DatabaseName.Value, "dsExportAssignments")</Value>
+                        <Style>
+                          <FontFamily>Arial</FontFamily>
+                          <FontSize>9pt</FontSize>
+                          <FontWeight>Bold</FontWeight>
+                          <Color>#24364B</Color>
+                        </Style>
+                      </TextRun>
+                    </TextRuns>
+                    <Style>
+                      <TextAlign>Left</TextAlign>
+                    </Style>
+                  </Paragraph>
+                </Paragraphs>
+                <Top>1.04in</Top>
+                <Left>0in</Left>
+                <Height>0.24in</Height>
+                <Width>10.6in</Width>
+                <Style>
+                  <VerticalAlign>Middle</VerticalAlign>
+                  <PaddingLeft>0pt</PaddingLeft>
+                  <PaddingRight>0pt</PaddingRight>
+                  <PaddingTop>0pt</PaddingTop>
+                  <PaddingBottom>0pt</PaddingBottom>
+                </Style>
+                <DataElementOutput>NoOutput</DataElementOutput>
+              </Textbox>
+              <Textbox Name="CaptureTime">
+                <CanGrow>true</CanGrow>
+                <KeepTogether>true</KeepTogether>
+                <Paragraphs>
+                  <Paragraph>
+                    <TextRuns>
+                      <TextRun>
+                        <Value>="Captured " &amp; Format(First(Fields!CapturedAtUtc.Value, "dsExportAssignments"), "dd MMM yyyy HH:mm:ss") &amp; " UTC  |  Backup " &amp; First(Fields!BackupID.Value, "dsExportAssignments")</Value>
+                        <Style>
+                          <FontFamily>Arial</FontFamily>
+                          <FontSize>8pt</FontSize>
+                          <FontWeight>Normal</FontWeight>
+                          <Color>#64748B</Color>
+                        </Style>
+                      </TextRun>
+                    </TextRuns>
+                    <Style>
+                      <TextAlign>Left</TextAlign>
+                    </Style>
+                  </Paragraph>
+                </Paragraphs>
+                <Top>1.34in</Top>
+                <Left>0in</Left>
+                <Height>0.21in</Height>
+                <Width>10.6in</Width>
+                <Style>
+                  <VerticalAlign>Middle</VerticalAlign>
+                  <PaddingLeft>0pt</PaddingLeft>
+                  <PaddingRight>0pt</PaddingRight>
+                  <PaddingTop>0pt</PaddingTop>
+                  <PaddingBottom>0pt</PaddingBottom>
+                </Style>
+                <DataElementOutput>NoOutput</DataElementOutput>
+              </Textbox>
+              <Rectangle Name="Metric0">
+                <ReportItems>
+                  <Textbox Name="MetricLabel0">
+                    <CanGrow>true</CanGrow>
+                    <KeepTogether>true</KeepTogether>
+                    <Paragraphs>
+                      <Paragraph>
+                        <TextRuns>
+                          <TextRun>
+                            <Value>PROJECTS WITH ASSIGNMENTS</Value>
+                            <Style>
+                              <FontFamily>Arial</FontFamily>
+                              <FontSize>7.5pt</FontSize>
+                              <FontWeight>Bold</FontWeight>
+                              <Color>#526477</Color>
+                            </Style>
+                          </TextRun>
+                        </TextRuns>
+                        <Style>
+                          <TextAlign>Left</TextAlign>
+                        </Style>
+                      </Paragraph>
+                    </Paragraphs>
+                    <Top>0.1in</Top>
+                    <Left>0.12in</Left>
+                    <Height>0.16in</Height>
+                    <Width>2.26in</Width>
+                    <Style>
+                      <VerticalAlign>Middle</VerticalAlign>
+                      <PaddingLeft>0pt</PaddingLeft>
+                      <PaddingRight>0pt</PaddingRight>
+                      <PaddingTop>0pt</PaddingTop>
+                      <PaddingBottom>0pt</PaddingBottom>
+                    </Style>
+                    <DataElementOutput>NoOutput</DataElementOutput>
+                  </Textbox>
+                  <Textbox Name="MetricValue0">
+                    <CanGrow>true</CanGrow>
+                    <KeepTogether>true</KeepTogether>
+                    <Paragraphs>
+                      <Paragraph>
+                        <TextRuns>
+                          <TextRun>
+                            <Value>=Format(First(Fields!ProjectCount.Value, "dsExportAssignments"), "N0")</Value>
+                            <Style>
+                              <FontFamily>Arial</FontFamily>
+                              <FontSize>20pt</FontSize>
+                              <FontWeight>Bold</FontWeight>
+                              <Color>#174A62</Color>
+                            </Style>
+                          </TextRun>
+                        </TextRuns>
+                        <Style>
+                          <TextAlign>Left</TextAlign>
+                        </Style>
+                      </Paragraph>
+                    </Paragraphs>
+                    <Top>0.31in</Top>
+                    <Left>0.12in</Left>
+                    <Height>0.27in</Height>
+                    <Width>2.26in</Width>
+                    <Style>
+                      <VerticalAlign>Middle</VerticalAlign>
+                      <PaddingLeft>0pt</PaddingLeft>
+                      <PaddingRight>0pt</PaddingRight>
+                      <PaddingTop>0pt</PaddingTop>
+                      <PaddingBottom>0pt</PaddingBottom>
+                    </Style>
+                    <DataElementOutput>NoOutput</DataElementOutput>
+                  </Textbox>
+                </ReportItems>
+                <KeepTogether>false</KeepTogether>
+                <Top>1.72in</Top>
+                <Left>0.0in</Left>
+                <Height>0.69in</Height>
+                <Width>2.5in</Width>
+                <Style>
+                  <BackgroundColor>#F1F5F9</BackgroundColor>
+                </Style>
+              </Rectangle>
+              <Rectangle Name="Metric1">
+                <ReportItems>
+                  <Textbox Name="MetricLabel1">
+                    <CanGrow>true</CanGrow>
+                    <KeepTogether>true</KeepTogether>
+                    <Paragraphs>
+                      <Paragraph>
+                        <TextRuns>
+                          <TextRun>
+                            <Value>STANDARD ASSIGNMENTS</Value>
+                            <Style>
+                              <FontFamily>Arial</FontFamily>
+                              <FontSize>7.5pt</FontSize>
+                              <FontWeight>Bold</FontWeight>
+                              <Color>#526477</Color>
+                            </Style>
+                          </TextRun>
+                        </TextRuns>
+                        <Style>
+                          <TextAlign>Left</TextAlign>
+                        </Style>
+                      </Paragraph>
+                    </Paragraphs>
+                    <Top>0.1in</Top>
+                    <Left>0.12in</Left>
+                    <Height>0.16in</Height>
+                    <Width>2.26in</Width>
+                    <Style>
+                      <VerticalAlign>Middle</VerticalAlign>
+                      <PaddingLeft>0pt</PaddingLeft>
+                      <PaddingRight>0pt</PaddingRight>
+                      <PaddingTop>0pt</PaddingTop>
+                      <PaddingBottom>0pt</PaddingBottom>
+                    </Style>
+                    <DataElementOutput>NoOutput</DataElementOutput>
+                  </Textbox>
+                  <Textbox Name="MetricValue1">
+                    <CanGrow>true</CanGrow>
+                    <KeepTogether>true</KeepTogether>
+                    <Paragraphs>
+                      <Paragraph>
+                        <TextRuns>
+                          <TextRun>
+                            <Value>=Format(First(Fields!StandardCount.Value, "dsExportAssignments"), "N0")</Value>
+                            <Style>
+                              <FontFamily>Arial</FontFamily>
+                              <FontSize>20pt</FontSize>
+                              <FontWeight>Bold</FontWeight>
+                              <Color>#087E8B</Color>
+                            </Style>
+                          </TextRun>
+                        </TextRuns>
+                        <Style>
+                          <TextAlign>Left</TextAlign>
+                        </Style>
+                      </Paragraph>
+                    </Paragraphs>
+                    <Top>0.31in</Top>
+                    <Left>0.12in</Left>
+                    <Height>0.27in</Height>
+                    <Width>2.26in</Width>
+                    <Style>
+                      <VerticalAlign>Middle</VerticalAlign>
+                      <PaddingLeft>0pt</PaddingLeft>
+                      <PaddingRight>0pt</PaddingRight>
+                      <PaddingTop>0pt</PaddingTop>
+                      <PaddingBottom>0pt</PaddingBottom>
+                    </Style>
+                    <DataElementOutput>NoOutput</DataElementOutput>
+                  </Textbox>
+                </ReportItems>
+                <KeepTogether>false</KeepTogether>
+                <Top>1.72in</Top>
+                <Left>2.7in</Left>
+                <Height>0.69in</Height>
+                <Width>2.5in</Width>
+                <Style>
+                  <BackgroundColor>#F1F5F9</BackgroundColor>
+                </Style>
+              </Rectangle>
+              <Rectangle Name="Metric2">
+                <ReportItems>
+                  <Textbox Name="MetricLabel2">
+                    <CanGrow>true</CanGrow>
+                    <KeepTogether>true</KeepTogether>
+                    <Paragraphs>
+                      <Paragraph>
+                        <TextRuns>
+                          <TextRun>
+                            <Value>JOINT ASSIGNMENTS</Value>
+                            <Style>
+                              <FontFamily>Arial</FontFamily>
+                              <FontSize>7.5pt</FontSize>
+                              <FontWeight>Bold</FontWeight>
+                              <Color>#526477</Color>
+                            </Style>
+                          </TextRun>
+                        </TextRuns>
+                        <Style>
+                          <TextAlign>Left</TextAlign>
+                        </Style>
+                      </Paragraph>
+                    </Paragraphs>
+                    <Top>0.1in</Top>
+                    <Left>0.12in</Left>
+                    <Height>0.16in</Height>
+                    <Width>2.26in</Width>
+                    <Style>
+                      <VerticalAlign>Middle</VerticalAlign>
+                      <PaddingLeft>0pt</PaddingLeft>
+                      <PaddingRight>0pt</PaddingRight>
+                      <PaddingTop>0pt</PaddingTop>
+                      <PaddingBottom>0pt</PaddingBottom>
+                    </Style>
+                    <DataElementOutput>NoOutput</DataElementOutput>
+                  </Textbox>
+                  <Textbox Name="MetricValue2">
+                    <CanGrow>true</CanGrow>
+                    <KeepTogether>true</KeepTogether>
+                    <Paragraphs>
+                      <Paragraph>
+                        <TextRuns>
+                          <TextRun>
+                            <Value>=Format(First(Fields!JointCount.Value, "dsExportAssignments"), "N0")</Value>
+                            <Style>
+                              <FontFamily>Arial</FontFamily>
+                              <FontSize>20pt</FontSize>
+                              <FontWeight>Bold</FontWeight>
+                              <Color>#174A62</Color>
+                            </Style>
+                          </TextRun>
+                        </TextRuns>
+                        <Style>
+                          <TextAlign>Left</TextAlign>
+                        </Style>
+                      </Paragraph>
+                    </Paragraphs>
+                    <Top>0.31in</Top>
+                    <Left>0.12in</Left>
+                    <Height>0.27in</Height>
+                    <Width>2.26in</Width>
+                    <Style>
+                      <VerticalAlign>Middle</VerticalAlign>
+                      <PaddingLeft>0pt</PaddingLeft>
+                      <PaddingRight>0pt</PaddingRight>
+                      <PaddingTop>0pt</PaddingTop>
+                      <PaddingBottom>0pt</PaddingBottom>
+                    </Style>
+                    <DataElementOutput>NoOutput</DataElementOutput>
+                  </Textbox>
+                </ReportItems>
+                <KeepTogether>false</KeepTogether>
+                <Top>1.72in</Top>
+                <Left>5.4in</Left>
+                <Height>0.69in</Height>
+                <Width>2.5in</Width>
+                <Style>
+                  <BackgroundColor>#F1F5F9</BackgroundColor>
+                </Style>
+              </Rectangle>
+              <Rectangle Name="Metric3">
+                <ReportItems>
+                  <Textbox Name="MetricLabel3">
+                    <CanGrow>true</CanGrow>
+                    <KeepTogether>true</KeepTogether>
+                    <Paragraphs>
+                      <Paragraph>
+                        <TextRuns>
+                          <TextRun>
+                            <Value>MANUAL ASSIGNMENTS</Value>
+                            <Style>
+                              <FontFamily>Arial</FontFamily>
+                              <FontSize>7.5pt</FontSize>
+                              <FontWeight>Bold</FontWeight>
+                              <Color>#526477</Color>
+                            </Style>
+                          </TextRun>
+                        </TextRuns>
+                        <Style>
+                          <TextAlign>Left</TextAlign>
+                        </Style>
+                      </Paragraph>
+                    </Paragraphs>
+                    <Top>0.1in</Top>
+                    <Left>0.12in</Left>
+                    <Height>0.16in</Height>
+                    <Width>2.26in</Width>
+                    <Style>
+                      <VerticalAlign>Middle</VerticalAlign>
+                      <PaddingLeft>0pt</PaddingLeft>
+                      <PaddingRight>0pt</PaddingRight>
+                      <PaddingTop>0pt</PaddingTop>
+                      <PaddingBottom>0pt</PaddingBottom>
+                    </Style>
+                    <DataElementOutput>NoOutput</DataElementOutput>
+                  </Textbox>
+                  <Textbox Name="MetricValue3">
+                    <CanGrow>true</CanGrow>
+                    <KeepTogether>true</KeepTogether>
+                    <Paragraphs>
+                      <Paragraph>
+                        <TextRuns>
+                          <TextRun>
+                            <Value>=Format(First(Fields!ManualCount.Value, "dsExportAssignments"), "N0")</Value>
+                            <Style>
+                              <FontFamily>Arial</FontFamily>
+                              <FontSize>20pt</FontSize>
+                              <FontWeight>Bold</FontWeight>
+                              <Color>#174A62</Color>
+                            </Style>
+                          </TextRun>
+                        </TextRuns>
+                        <Style>
+                          <TextAlign>Left</TextAlign>
+                        </Style>
+                      </Paragraph>
+                    </Paragraphs>
+                    <Top>0.31in</Top>
+                    <Left>0.12in</Left>
+                    <Height>0.27in</Height>
+                    <Width>2.26in</Width>
+                    <Style>
+                      <VerticalAlign>Middle</VerticalAlign>
+                      <PaddingLeft>0pt</PaddingLeft>
+                      <PaddingRight>0pt</PaddingRight>
+                      <PaddingTop>0pt</PaddingTop>
+                      <PaddingBottom>0pt</PaddingBottom>
+                    </Style>
+                    <DataElementOutput>NoOutput</DataElementOutput>
+                  </Textbox>
+                </ReportItems>
+                <KeepTogether>false</KeepTogether>
+                <Top>1.72in</Top>
+                <Left>8.100000000000001in</Left>
+                <Height>0.69in</Height>
+                <Width>2.5in</Width>
+                <Style>
+                  <BackgroundColor>#F1F5F9</BackgroundColor>
+                </Style>
+              </Rectangle>
+              <Textbox Name="ExportStatus">
+                <CanGrow>true</CanGrow>
+                <KeepTogether>true</KeepTogether>
+                <Paragraphs>
+                  <Paragraph>
+                    <TextRuns>
+                      <TextRun>
+                        <Value>=If(First(Fields!ExportStatus.Value, "dsExportAssignments")="READY", "Ready to export. Choose CSV to back up assignments for the restore script. Choose Excel for a table-only review. No data has been changed.", First(Fields!ExportMessage.Value, "dsExportAssignments"))</Value>
+                        <Style>
+                          <FontFamily>Arial</FontFamily>
+                          <FontSize>9.5pt</FontSize>
+                          <FontWeight>Bold</FontWeight>
+                          <Color>#24364B</Color>
+                        </Style>
+                      </TextRun>
+                    </TextRuns>
+                    <Style>
+                      <TextAlign>Left</TextAlign>
+                    </Style>
+                  </Paragraph>
+                </Paragraphs>
+                <Top>2.56in</Top>
+                <Left>0in</Left>
+                <Height>0.56in</Height>
+                <Width>10.6in</Width>
+                <Style>
+                  <VerticalAlign>Middle</VerticalAlign>
+                  <PaddingLeft>7pt</PaddingLeft>
+                  <PaddingRight>7pt</PaddingRight>
+                  <PaddingTop>7pt</PaddingTop>
+                  <PaddingBottom>7pt</PaddingBottom>
+                  <BackgroundColor>=If(First(Fields!ExportStatus.Value, "dsExportAssignments")="REVIEW", "#FFF7ED", "#ECFDF5")</BackgroundColor>
+                </Style>
+                <DataElementOutput>NoOutput</DataElementOutput>
+              </Textbox>
+              <Textbox Name="AssignmentHeading">
+                <CanGrow>true</CanGrow>
+                <KeepTogether>true</KeepTogether>
+                <Paragraphs>
+                  <Paragraph>
+                    <TextRuns>
+                      <TextRun>
+                        <Value>Assignment overview</Value>
+                        <Style>
+                          <FontFamily>Arial</FontFamily>
+                          <FontSize>12pt</FontSize>
+                          <FontWeight>Bold</FontWeight>
+                          <Color>#24364B</Color>
+                        </Style>
+                      </TextRun>
+                    </TextRuns>
+                    <Style>
+                      <TextAlign>Left</TextAlign>
+                    </Style>
+                  </Paragraph>
+                </Paragraphs>
+                <Top>3.31in</Top>
+                <Left>0in</Left>
+                <Height>0.25in</Height>
+                <Width>10.6in</Width>
+                <Style>
+                  <VerticalAlign>Middle</VerticalAlign>
+                  <PaddingLeft>0pt</PaddingLeft>
+                  <PaddingRight>0pt</PaddingRight>
+                  <PaddingTop>0pt</PaddingTop>
+                  <PaddingBottom>0pt</PaddingBottom>
+                </Style>
+                <DataElementOutput>NoOutput</DataElementOutput>
+              </Textbox>
+              <Textbox Name="UnassignedNote">
+                <CanGrow>true</CanGrow>
+                <KeepTogether>true</KeepTogether>
+                <Paragraphs>
+                  <Paragraph>
+                    <TextRuns>
+                      <TextRun>
+                        <Value>=Format(First(Fields!UnassignedProjectCount.Value, "dsExportAssignments"), "N0") &amp; " projects have no assignments and are omitted. NULL and zero IDs both mean Not assigned."</Value>
+                        <Style>
+                          <FontFamily>Arial</FontFamily>
+                          <FontSize>8pt</FontSize>
+                          <FontWeight>Normal</FontWeight>
+                          <Color>#64748B</Color>
+                        </Style>
+                      </TextRun>
+                    </TextRuns>
+                    <Style>
+                      <TextAlign>Left</TextAlign>
+                    </Style>
+                  </Paragraph>
+                </Paragraphs>
+                <Top>3.63in</Top>
+                <Left>0in</Left>
+                <Height>0.23in</Height>
+                <Width>10.6in</Width>
+                <Style>
+                  <VerticalAlign>Middle</VerticalAlign>
+                  <PaddingLeft>0pt</PaddingLeft>
+                  <PaddingRight>0pt</PaddingRight>
+                  <PaddingTop>0pt</PaddingTop>
+                  <PaddingBottom>0pt</PaddingBottom>
+                </Style>
+                <DataElementOutput>NoOutput</DataElementOutput>
+              </Textbox>
+              <Tablix Name="AssignmentTable">
+                <TablixBody>
+                  <TablixColumns>
+                    <TablixColumn>
+                      <Width>1.45in</Width>
+                    </TablixColumn>
+                    <TablixColumn>
+                      <Width>2.65in</Width>
+                    </TablixColumn>
+                    <TablixColumn>
+                      <Width>2.65in</Width>
+                    </TablixColumn>
+                    <TablixColumn>
+                      <Width>2.65in</Width>
+                    </TablixColumn>
+                    <TablixColumn>
+                      <Width>1.2in</Width>
+                    </TablixColumn>
+                  </TablixColumns>
+                  <TablixRows>
+                    <TablixRow>
+                      <Height>0.36in</Height>
+                      <TablixCells>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="AssignmentTable_Cell0_0">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>Project ID</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Bold</FontWeight>
+                                        <Color>White</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>#24485C</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="AssignmentTable_Cell0_1">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>Standard template</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Bold</FontWeight>
+                                        <Color>White</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>#24485C</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="AssignmentTable_Cell0_2">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>Joint template</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Bold</FontWeight>
+                                        <Color>White</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>#24485C</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="AssignmentTable_Cell0_3">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>Manual template</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Bold</FontWeight>
+                                        <Color>White</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>#24485C</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="AssignmentTable_Cell0_4">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>Status</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Bold</FontWeight>
+                                        <Color>White</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>#24485C</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                      </TablixCells>
+                    </TablixRow>
+                    <TablixRow>
+                      <Height>0.38in</Height>
+                      <TablixCells>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="AssignmentTable_Cell1_0">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>=Fields!ProjectID.Value</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Normal</FontWeight>
+                                        <Color>#334155</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>=If(RowNumber("AssignmentTable") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="AssignmentTable_Cell1_1">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>=If(IsNothing(Fields!StandardTemplateName.Value), "Not assigned", Fields!StandardTemplateName.Value)</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Normal</FontWeight>
+                                        <Color>#334155</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>=If(RowNumber("AssignmentTable") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="AssignmentTable_Cell1_2">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>=If(IsNothing(Fields!JointTemplateName.Value), "Not assigned", Fields!JointTemplateName.Value)</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Normal</FontWeight>
+                                        <Color>#334155</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>=If(RowNumber("AssignmentTable") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="AssignmentTable_Cell1_3">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>=If(IsNothing(Fields!ManualTemplateName.Value), "Not assigned", Fields!ManualTemplateName.Value)</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Normal</FontWeight>
+                                        <Color>#334155</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>=If(RowNumber("AssignmentTable") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                        <TablixCell>
+                          <CellContents>
+                            <Textbox Name="AssignmentTable_Cell1_4">
+                              <CanGrow>true</CanGrow>
+                              <KeepTogether>true</KeepTogether>
+                              <Paragraphs>
+                                <Paragraph>
+                                  <TextRuns>
+                                    <TextRun>
+                                      <Value>=Fields!RowStatus.Value</Value>
+                                      <Style>
+                                        <FontFamily>Arial</FontFamily>
+                                        <FontSize>9pt</FontSize>
+                                        <FontWeight>Normal</FontWeight>
+                                        <Color>#334155</Color>
+                                      </Style>
+                                    </TextRun>
+                                  </TextRuns>
+                                  <Style>
+                                    <TextAlign>Left</TextAlign>
+                                  </Style>
+                                </Paragraph>
+                              </Paragraphs>
+                              <Style>
+                                <VerticalAlign>Top</VerticalAlign>
+                                <PaddingLeft>4pt</PaddingLeft>
+                                <PaddingRight>4pt</PaddingRight>
+                                <PaddingTop>4pt</PaddingTop>
+                                <PaddingBottom>4pt</PaddingBottom>
+                                <BackgroundColor>=If(RowNumber("AssignmentTable") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                              </Style>
+                              <DataElementOutput>NoOutput</DataElementOutput>
+                            </Textbox>
+                          </CellContents>
+                        </TablixCell>
+                      </TablixCells>
+                    </TablixRow>
+                  </TablixRows>
+                </TablixBody>
+                <TablixColumnHierarchy>
+                  <TablixMembers>
+                    <TablixMember/>
+                    <TablixMember/>
+                    <TablixMember/>
+                    <TablixMember/>
+                    <TablixMember/>
+                  </TablixMembers>
+                </TablixColumnHierarchy>
+                <TablixRowHierarchy>
+                  <TablixMembers>
+                    <TablixMember>
+                      <KeepWithGroup>After</KeepWithGroup>
+                      <RepeatOnNewPage>true</RepeatOnNewPage>
+                      <FixedData>true</FixedData>
+                    </TablixMember>
+                    <TablixMember>
+                      <Group Name="AssignmentTable_Details"/>
+                      <SortExpressions>
+                        <SortExpression>
+                          <Value>=Fields!SortKey.Value</Value>
+                        </SortExpression>
+                      </SortExpressions>
+                    </TablixMember>
+                  </TablixMembers>
+                </TablixRowHierarchy>
+                <DataSetName>dsExportAssignments</DataSetName>
+                <Filters>
+                  <Filter>
+                    <FilterExpression>=Fields!RowKind.Value</FilterExpression>
+                    <Operator>Equal</Operator>
+                    <FilterValues>
+                      <FilterValue>DETAIL</FilterValue>
+                    </FilterValues>
+                  </Filter>
+                </Filters>
+                <NoRowsMessage>No projects with invoice-template assignments were found.</NoRowsMessage>
+                <Top>4.000in</Top>
+                <Left>0.000in</Left>
+                <Height>0.740in</Height>
+                <Width>10.600in</Width>
+                <Style>
+                  <FontFamily>Arial</FontFamily>
+                  <FontSize>9pt</FontSize>
+                  <Color>#64748B</Color>
+                </Style>
+                <DataElementOutput>NoOutput</DataElementOutput>
+              </Tablix>
+              <Rectangle Name="IssueSection">
+                <ReportItems>
+                  <Textbox Name="IssueHeading">
+                    <CanGrow>true</CanGrow>
+                    <KeepTogether>true</KeepTogether>
+                    <Paragraphs>
+                      <Paragraph>
+                        <TextRuns>
+                          <TextRun>
+                            <Value>Source issues - correct these before exporting</Value>
+                            <Style>
+                              <FontFamily>Arial</FontFamily>
+                              <FontSize>11pt</FontSize>
+                              <FontWeight>Bold</FontWeight>
+                              <Color>#9A3412</Color>
+                            </Style>
+                          </TextRun>
+                        </TextRuns>
+                        <Style>
+                          <TextAlign>Left</TextAlign>
+                        </Style>
+                      </Paragraph>
+                    </Paragraphs>
+                    <Top>0in</Top>
+                    <Left>0in</Left>
+                    <Height>0.25in</Height>
+                    <Width>10.6in</Width>
+                    <Style>
+                      <VerticalAlign>Middle</VerticalAlign>
+                      <PaddingLeft>0pt</PaddingLeft>
+                      <PaddingRight>0pt</PaddingRight>
+                      <PaddingTop>0pt</PaddingTop>
+                      <PaddingBottom>0pt</PaddingBottom>
+                    </Style>
+                    <DataElementOutput>NoOutput</DataElementOutput>
+                  </Textbox>
+                  <Tablix Name="IssueTable">
+                    <TablixBody>
+                      <TablixColumns>
+                        <TablixColumn>
+                          <Width>1.45in</Width>
+                        </TablixColumn>
+                        <TablixColumn>
+                          <Width>1.0in</Width>
+                        </TablixColumn>
+                        <TablixColumn>
+                          <Width>2.4in</Width>
+                        </TablixColumn>
+                        <TablixColumn>
+                          <Width>5.75in</Width>
+                        </TablixColumn>
+                      </TablixColumns>
+                      <TablixRows>
+                        <TablixRow>
+                          <Height>0.34in</Height>
+                          <TablixCells>
+                            <TablixCell>
+                              <CellContents>
+                                <Textbox Name="IssueTable_Cell0_0">
+                                  <CanGrow>true</CanGrow>
+                                  <KeepTogether>true</KeepTogether>
+                                  <Paragraphs>
+                                    <Paragraph>
+                                      <TextRuns>
+                                        <TextRun>
+                                          <Value>Project ID</Value>
+                                          <Style>
+                                            <FontFamily>Arial</FontFamily>
+                                            <FontSize>9pt</FontSize>
+                                            <FontWeight>Bold</FontWeight>
+                                            <Color>White</Color>
+                                          </Style>
+                                        </TextRun>
+                                      </TextRuns>
+                                      <Style>
+                                        <TextAlign>Left</TextAlign>
+                                      </Style>
+                                    </Paragraph>
+                                  </Paragraphs>
+                                  <Style>
+                                    <VerticalAlign>Top</VerticalAlign>
+                                    <PaddingLeft>4pt</PaddingLeft>
+                                    <PaddingRight>4pt</PaddingRight>
+                                    <PaddingTop>4pt</PaddingTop>
+                                    <PaddingBottom>4pt</PaddingBottom>
+                                    <BackgroundColor>#24485C</BackgroundColor>
+                                  </Style>
+                                  <DataElementOutput>NoOutput</DataElementOutput>
+                                </Textbox>
+                              </CellContents>
+                            </TablixCell>
+                            <TablixCell>
+                              <CellContents>
+                                <Textbox Name="IssueTable_Cell0_1">
+                                  <CanGrow>true</CanGrow>
+                                  <KeepTogether>true</KeepTogether>
+                                  <Paragraphs>
+                                    <Paragraph>
+                                      <TextRuns>
+                                        <TextRun>
+                                          <Value>Role</Value>
+                                          <Style>
+                                            <FontFamily>Arial</FontFamily>
+                                            <FontSize>9pt</FontSize>
+                                            <FontWeight>Bold</FontWeight>
+                                            <Color>White</Color>
+                                          </Style>
+                                        </TextRun>
+                                      </TextRuns>
+                                      <Style>
+                                        <TextAlign>Left</TextAlign>
+                                      </Style>
+                                    </Paragraph>
+                                  </Paragraphs>
+                                  <Style>
+                                    <VerticalAlign>Top</VerticalAlign>
+                                    <PaddingLeft>4pt</PaddingLeft>
+                                    <PaddingRight>4pt</PaddingRight>
+                                    <PaddingTop>4pt</PaddingTop>
+                                    <PaddingBottom>4pt</PaddingBottom>
+                                    <BackgroundColor>#24485C</BackgroundColor>
+                                  </Style>
+                                  <DataElementOutput>NoOutput</DataElementOutput>
+                                </Textbox>
+                              </CellContents>
+                            </TablixCell>
+                            <TablixCell>
+                              <CellContents>
+                                <Textbox Name="IssueTable_Cell0_2">
+                                  <CanGrow>true</CanGrow>
+                                  <KeepTogether>true</KeepTogether>
+                                  <Paragraphs>
+                                    <Paragraph>
+                                      <TextRuns>
+                                        <TextRun>
+                                          <Value>Template name</Value>
+                                          <Style>
+                                            <FontFamily>Arial</FontFamily>
+                                            <FontSize>9pt</FontSize>
+                                            <FontWeight>Bold</FontWeight>
+                                            <Color>White</Color>
+                                          </Style>
+                                        </TextRun>
+                                      </TextRuns>
+                                      <Style>
+                                        <TextAlign>Left</TextAlign>
+                                      </Style>
+                                    </Paragraph>
+                                  </Paragraphs>
+                                  <Style>
+                                    <VerticalAlign>Top</VerticalAlign>
+                                    <PaddingLeft>4pt</PaddingLeft>
+                                    <PaddingRight>4pt</PaddingRight>
+                                    <PaddingTop>4pt</PaddingTop>
+                                    <PaddingBottom>4pt</PaddingBottom>
+                                    <BackgroundColor>#24485C</BackgroundColor>
+                                  </Style>
+                                  <DataElementOutput>NoOutput</DataElementOutput>
+                                </Textbox>
+                              </CellContents>
+                            </TablixCell>
+                            <TablixCell>
+                              <CellContents>
+                                <Textbox Name="IssueTable_Cell0_3">
+                                  <CanGrow>true</CanGrow>
+                                  <KeepTogether>true</KeepTogether>
+                                  <Paragraphs>
+                                    <Paragraph>
+                                      <TextRuns>
+                                        <TextRun>
+                                          <Value>What needs attention</Value>
+                                          <Style>
+                                            <FontFamily>Arial</FontFamily>
+                                            <FontSize>9pt</FontSize>
+                                            <FontWeight>Bold</FontWeight>
+                                            <Color>White</Color>
+                                          </Style>
+                                        </TextRun>
+                                      </TextRuns>
+                                      <Style>
+                                        <TextAlign>Left</TextAlign>
+                                      </Style>
+                                    </Paragraph>
+                                  </Paragraphs>
+                                  <Style>
+                                    <VerticalAlign>Top</VerticalAlign>
+                                    <PaddingLeft>4pt</PaddingLeft>
+                                    <PaddingRight>4pt</PaddingRight>
+                                    <PaddingTop>4pt</PaddingTop>
+                                    <PaddingBottom>4pt</PaddingBottom>
+                                    <BackgroundColor>#24485C</BackgroundColor>
+                                  </Style>
+                                  <DataElementOutput>NoOutput</DataElementOutput>
+                                </Textbox>
+                              </CellContents>
+                            </TablixCell>
+                          </TablixCells>
+                        </TablixRow>
+                        <TablixRow>
+                          <Height>0.38in</Height>
+                          <TablixCells>
+                            <TablixCell>
+                              <CellContents>
+                                <Textbox Name="IssueTable_Cell1_0">
+                                  <CanGrow>true</CanGrow>
+                                  <KeepTogether>true</KeepTogether>
+                                  <Paragraphs>
+                                    <Paragraph>
+                                      <TextRuns>
+                                        <TextRun>
+                                          <Value>=Fields!ProjectID.Value</Value>
+                                          <Style>
+                                            <FontFamily>Arial</FontFamily>
+                                            <FontSize>9pt</FontSize>
+                                            <FontWeight>Normal</FontWeight>
+                                            <Color>#334155</Color>
+                                          </Style>
+                                        </TextRun>
+                                      </TextRuns>
+                                      <Style>
+                                        <TextAlign>Left</TextAlign>
+                                      </Style>
+                                    </Paragraph>
+                                  </Paragraphs>
+                                  <Style>
+                                    <VerticalAlign>Top</VerticalAlign>
+                                    <PaddingLeft>4pt</PaddingLeft>
+                                    <PaddingRight>4pt</PaddingRight>
+                                    <PaddingTop>4pt</PaddingTop>
+                                    <PaddingBottom>4pt</PaddingBottom>
+                                    <BackgroundColor>=If(RowNumber("IssueTable") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                                  </Style>
+                                  <DataElementOutput>NoOutput</DataElementOutput>
+                                </Textbox>
+                              </CellContents>
+                            </TablixCell>
+                            <TablixCell>
+                              <CellContents>
+                                <Textbox Name="IssueTable_Cell1_1">
+                                  <CanGrow>true</CanGrow>
+                                  <KeepTogether>true</KeepTogether>
+                                  <Paragraphs>
+                                    <Paragraph>
+                                      <TextRuns>
+                                        <TextRun>
+                                          <Value>=Fields!TemplateRole.Value</Value>
+                                          <Style>
+                                            <FontFamily>Arial</FontFamily>
+                                            <FontSize>9pt</FontSize>
+                                            <FontWeight>Normal</FontWeight>
+                                            <Color>#334155</Color>
+                                          </Style>
+                                        </TextRun>
+                                      </TextRuns>
+                                      <Style>
+                                        <TextAlign>Left</TextAlign>
+                                      </Style>
+                                    </Paragraph>
+                                  </Paragraphs>
+                                  <Style>
+                                    <VerticalAlign>Top</VerticalAlign>
+                                    <PaddingLeft>4pt</PaddingLeft>
+                                    <PaddingRight>4pt</PaddingRight>
+                                    <PaddingTop>4pt</PaddingTop>
+                                    <PaddingBottom>4pt</PaddingBottom>
+                                    <BackgroundColor>=If(RowNumber("IssueTable") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                                  </Style>
+                                  <DataElementOutput>NoOutput</DataElementOutput>
+                                </Textbox>
+                              </CellContents>
+                            </TablixCell>
+                            <TablixCell>
+                              <CellContents>
+                                <Textbox Name="IssueTable_Cell1_2">
+                                  <CanGrow>true</CanGrow>
+                                  <KeepTogether>true</KeepTogether>
+                                  <Paragraphs>
+                                    <Paragraph>
+                                      <TextRuns>
+                                        <TextRun>
+                                          <Value>=Fields!IssueTemplateName.Value</Value>
+                                          <Style>
+                                            <FontFamily>Arial</FontFamily>
+                                            <FontSize>9pt</FontSize>
+                                            <FontWeight>Normal</FontWeight>
+                                            <Color>#334155</Color>
+                                          </Style>
+                                        </TextRun>
+                                      </TextRuns>
+                                      <Style>
+                                        <TextAlign>Left</TextAlign>
+                                      </Style>
+                                    </Paragraph>
+                                  </Paragraphs>
+                                  <Style>
+                                    <VerticalAlign>Top</VerticalAlign>
+                                    <PaddingLeft>4pt</PaddingLeft>
+                                    <PaddingRight>4pt</PaddingRight>
+                                    <PaddingTop>4pt</PaddingTop>
+                                    <PaddingBottom>4pt</PaddingBottom>
+                                    <BackgroundColor>=If(RowNumber("IssueTable") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                                  </Style>
+                                  <DataElementOutput>NoOutput</DataElementOutput>
+                                </Textbox>
+                              </CellContents>
+                            </TablixCell>
+                            <TablixCell>
+                              <CellContents>
+                                <Textbox Name="IssueTable_Cell1_3">
+                                  <CanGrow>true</CanGrow>
+                                  <KeepTogether>true</KeepTogether>
+                                  <Paragraphs>
+                                    <Paragraph>
+                                      <TextRuns>
+                                        <TextRun>
+                                          <Value>=Fields!RowMessage.Value</Value>
+                                          <Style>
+                                            <FontFamily>Arial</FontFamily>
+                                            <FontSize>9pt</FontSize>
+                                            <FontWeight>Normal</FontWeight>
+                                            <Color>#334155</Color>
+                                          </Style>
+                                        </TextRun>
+                                      </TextRuns>
+                                      <Style>
+                                        <TextAlign>Left</TextAlign>
+                                      </Style>
+                                    </Paragraph>
+                                  </Paragraphs>
+                                  <Style>
+                                    <VerticalAlign>Top</VerticalAlign>
+                                    <PaddingLeft>4pt</PaddingLeft>
+                                    <PaddingRight>4pt</PaddingRight>
+                                    <PaddingTop>4pt</PaddingTop>
+                                    <PaddingBottom>4pt</PaddingBottom>
+                                    <BackgroundColor>=If(RowNumber("IssueTable") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                                  </Style>
+                                  <DataElementOutput>NoOutput</DataElementOutput>
+                                </Textbox>
+                              </CellContents>
+                            </TablixCell>
+                          </TablixCells>
+                        </TablixRow>
+                      </TablixRows>
+                    </TablixBody>
+                    <TablixColumnHierarchy>
+                      <TablixMembers>
+                        <TablixMember/>
+                        <TablixMember/>
+                        <TablixMember/>
+                        <TablixMember/>
+                      </TablixMembers>
+                    </TablixColumnHierarchy>
+                    <TablixRowHierarchy>
+                      <TablixMembers>
+                        <TablixMember>
+                          <KeepWithGroup>After</KeepWithGroup>
+                          <RepeatOnNewPage>true</RepeatOnNewPage>
+                          <FixedData>true</FixedData>
+                        </TablixMember>
+                        <TablixMember>
+                          <Group Name="IssueTable_Details"/>
+                          <SortExpressions>
+                            <SortExpression>
+                              <Value>=Fields!SortKey.Value</Value>
+                            </SortExpression>
+                          </SortExpressions>
+                        </TablixMember>
+                      </TablixMembers>
+                    </TablixRowHierarchy>
+                    <DataSetName>dsExportAssignments</DataSetName>
+                    <Filters>
+                      <Filter>
+                        <FilterExpression>=Fields!RowKind.Value</FilterExpression>
+                        <Operator>Equal</Operator>
+                        <FilterValues>
+                          <FilterValue>ISSUE</FilterValue>
+                        </FilterValues>
+                      </Filter>
+                    </Filters>
+                    <NoRowsMessage>No source issues.</NoRowsMessage>
+                    <Top>0.320in</Top>
+                    <Left>0.000in</Left>
+                    <Height>0.720in</Height>
+                    <Width>10.600in</Width>
+                    <Style>
+                      <FontFamily>Arial</FontFamily>
+                      <FontSize>9pt</FontSize>
+                      <Color>#64748B</Color>
+                    </Style>
+                    <DataElementOutput>NoOutput</DataElementOutput>
+                  </Tablix>
+                </ReportItems>
+                <KeepTogether>false</KeepTogether>
+                <Top>4.91in</Top>
+                <Left>0in</Left>
+                <Height>1.04in</Height>
+                <Width>10.6in</Width>
+                <Style/>
+                <Visibility>
+                  <Hidden>=First(Fields!IssueCount.Value, "dsExportAssignments")=0</Hidden>
+                </Visibility>
+              </Rectangle>
+            </ReportItems>
+            <KeepTogether>false</KeepTogether>
+            <Top>0.74in</Top>
+            <Left>0in</Left>
+            <Height>5.95in</Height>
+            <Width>10.6in</Width>
+            <Style/>
+          <Visibility><Hidden>=Globals!RenderFormat.Name = "EXCELOPENXML" Or Globals!RenderFormat.Name = "EXCEL"</Hidden></Visibility></Rectangle>
+          <Tablix Name="CSVAssignments">
+            <TablixBody>
+              <TablixColumns>
+                <TablixColumn>
+                  <Width>1.6in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>3.0in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>3.0in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>3.0in</Width>
+                </TablixColumn>
+              </TablixColumns>
+              <TablixRows>
+                <TablixRow>
+                  <Height>0.36in</Height>
+                  <TablixCells>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="CSVAssignments_Cell0_0">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>ProjectID</Value>
+                                  <Style>
+                                    <FontFamily>Arial</FontFamily>
+                                    <FontSize>9pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>White</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <TextAlign>Left</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <Style>
+                            <VerticalAlign>Top</VerticalAlign>
+                            <PaddingLeft>4pt</PaddingLeft>
+                            <PaddingRight>4pt</PaddingRight>
+                            <PaddingTop>4pt</PaddingTop>
+                            <PaddingBottom>4pt</PaddingBottom>
+                            <BackgroundColor>#24485C</BackgroundColor>
+                          </Style>
+                          <DataElementOutput>NoOutput</DataElementOutput>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="CSVAssignments_Cell0_1">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>StandardTemplateName</Value>
+                                  <Style>
+                                    <FontFamily>Arial</FontFamily>
+                                    <FontSize>9pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>White</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <TextAlign>Left</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <Style>
+                            <VerticalAlign>Top</VerticalAlign>
+                            <PaddingLeft>4pt</PaddingLeft>
+                            <PaddingRight>4pt</PaddingRight>
+                            <PaddingTop>4pt</PaddingTop>
+                            <PaddingBottom>4pt</PaddingBottom>
+                            <BackgroundColor>#24485C</BackgroundColor>
+                          </Style>
+                          <DataElementOutput>NoOutput</DataElementOutput>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="CSVAssignments_Cell0_2">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>JointTemplateName</Value>
+                                  <Style>
+                                    <FontFamily>Arial</FontFamily>
+                                    <FontSize>9pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>White</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <TextAlign>Left</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <Style>
+                            <VerticalAlign>Top</VerticalAlign>
+                            <PaddingLeft>4pt</PaddingLeft>
+                            <PaddingRight>4pt</PaddingRight>
+                            <PaddingTop>4pt</PaddingTop>
+                            <PaddingBottom>4pt</PaddingBottom>
+                            <BackgroundColor>#24485C</BackgroundColor>
+                          </Style>
+                          <DataElementOutput>NoOutput</DataElementOutput>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="CSVAssignments_Cell0_3">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>ManualTemplateName</Value>
+                                  <Style>
+                                    <FontFamily>Arial</FontFamily>
+                                    <FontSize>9pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>White</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <TextAlign>Left</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <Style>
+                            <VerticalAlign>Top</VerticalAlign>
+                            <PaddingLeft>4pt</PaddingLeft>
+                            <PaddingRight>4pt</PaddingRight>
+                            <PaddingTop>4pt</PaddingTop>
+                            <PaddingBottom>4pt</PaddingBottom>
+                            <BackgroundColor>#24485C</BackgroundColor>
+                          </Style>
+                          <DataElementOutput>NoOutput</DataElementOutput>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                  </TablixCells>
+                </TablixRow>
+                <TablixRow>
+                  <Height>0.38in</Height>
+                  <TablixCells>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="CSVAssignments_Cell1_0">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!ProjectID.Value</Value>
+                                  <Style>
+                                    <FontFamily>Arial</FontFamily>
+                                    <FontSize>9pt</FontSize>
+                                    <FontWeight>Normal</FontWeight>
+                                    <Color>#334155</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <TextAlign>Left</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <Style>
+                            <VerticalAlign>Top</VerticalAlign>
+                            <PaddingLeft>4pt</PaddingLeft>
+                            <PaddingRight>4pt</PaddingRight>
+                            <PaddingTop>4pt</PaddingTop>
+                            <PaddingBottom>4pt</PaddingBottom>
+                            <BackgroundColor>=If(RowNumber("CSVAssignments") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                          </Style>
+                          <DataElementName>ProjectID</DataElementName>
+                          <DataElementOutput>Output</DataElementOutput>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="CSVAssignments_Cell1_1">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!StandardTemplateName.Value</Value>
+                                  <Style>
+                                    <FontFamily>Arial</FontFamily>
+                                    <FontSize>9pt</FontSize>
+                                    <FontWeight>Normal</FontWeight>
+                                    <Color>#334155</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <TextAlign>Left</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <Style>
+                            <VerticalAlign>Top</VerticalAlign>
+                            <PaddingLeft>4pt</PaddingLeft>
+                            <PaddingRight>4pt</PaddingRight>
+                            <PaddingTop>4pt</PaddingTop>
+                            <PaddingBottom>4pt</PaddingBottom>
+                            <BackgroundColor>=If(RowNumber("CSVAssignments") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                          </Style>
+                          <DataElementName>StandardTemplateName</DataElementName>
+                          <DataElementOutput>Output</DataElementOutput>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="CSVAssignments_Cell1_2">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!JointTemplateName.Value</Value>
+                                  <Style>
+                                    <FontFamily>Arial</FontFamily>
+                                    <FontSize>9pt</FontSize>
+                                    <FontWeight>Normal</FontWeight>
+                                    <Color>#334155</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <TextAlign>Left</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <Style>
+                            <VerticalAlign>Top</VerticalAlign>
+                            <PaddingLeft>4pt</PaddingLeft>
+                            <PaddingRight>4pt</PaddingRight>
+                            <PaddingTop>4pt</PaddingTop>
+                            <PaddingBottom>4pt</PaddingBottom>
+                            <BackgroundColor>=If(RowNumber("CSVAssignments") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                          </Style>
+                          <DataElementName>JointTemplateName</DataElementName>
+                          <DataElementOutput>Output</DataElementOutput>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="CSVAssignments_Cell1_3">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!ManualTemplateName.Value</Value>
+                                  <Style>
+                                    <FontFamily>Arial</FontFamily>
+                                    <FontSize>9pt</FontSize>
+                                    <FontWeight>Normal</FontWeight>
+                                    <Color>#334155</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <TextAlign>Left</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <Style>
+                            <VerticalAlign>Top</VerticalAlign>
+                            <PaddingLeft>4pt</PaddingLeft>
+                            <PaddingRight>4pt</PaddingRight>
+                            <PaddingTop>4pt</PaddingTop>
+                            <PaddingBottom>4pt</PaddingBottom>
+                            <BackgroundColor>=If(RowNumber("CSVAssignments") Mod 2 = 0, "#F1F5F9", "White")</BackgroundColor>
+                          </Style>
+                          <DataElementName>ManualTemplateName</DataElementName>
+                          <DataElementOutput>Output</DataElementOutput>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                  </TablixCells>
+                </TablixRow>
+              </TablixRows>
+            </TablixBody>
+            <TablixColumnHierarchy>
+              <TablixMembers>
+                <TablixMember/>
+                <TablixMember/>
+                <TablixMember/>
+                <TablixMember/>
+              </TablixMembers>
+            </TablixColumnHierarchy>
+            <TablixRowHierarchy>
+              <TablixMembers>
+                <TablixMember>
+                  <KeepWithGroup>After</KeepWithGroup>
+                  <RepeatOnNewPage>true</RepeatOnNewPage>
+                  <FixedData>false</FixedData>
+                  <DataElementOutput>NoOutput</DataElementOutput>
+                </TablixMember>
+                <TablixMember>
+                  <Group Name="CSVAssignments_Details"/>
+                  <SortExpressions>
+                    <SortExpression>
+                      <Value>=Fields!SortKey.Value</Value>
+                    </SortExpression>
+                  </SortExpressions>
+                  <DataElementOutput>Output</DataElementOutput>
+                  <DataElementName>Assignment</DataElementName>
+                </TablixMember>
+              </TablixMembers>
+            </TablixRowHierarchy>
+            <DataSetName>dsExportAssignments</DataSetName>
+            <Filters>
+              <Filter>
+                <FilterExpression>=Fields!RowKind.Value</FilterExpression>
+                <Operator>Equal</Operator>
+                <FilterValues>
+                  <FilterValue>DETAIL</FilterValue>
+                </FilterValues>
+              </Filter>
+              <Filter>
+                <FilterExpression>=Fields!ExportStatus.Value</FilterExpression>
+                <Operator>Equal</Operator>
+                <FilterValues>
+                  <FilterValue>READY</FilterValue>
+                </FilterValues>
+              </Filter>
+            </Filters>
+            <NoRowsMessage/>
+            <Top>6.69in</Top>
+            <Left>0in</Left>
+            <Height>0.740in</Height>
+            <Width>10.6in</Width>
+            <Style>
+              <FontFamily>Arial</FontFamily>
+              <FontSize>9pt</FontSize>
+              <Color>#64748B</Color>
+            </Style>
+            <DataElementName>Assignments</DataElementName>
+            <DataElementOutput>Output</DataElementOutput>
+            <Visibility>
+              <Hidden>true</Hidden>
+            </Visibility>
+          </Tablix>
+        </ReportItems>
+        <Height>7.43in</Height>
+        <Style/>
+      </Body>
+      <Width>10.6in</Width>
+      <Page>
+        <PageHeight>8.3in</PageHeight>
+        <PageWidth>11.7in</PageWidth>
+        <InteractiveHeight>0in</InteractiveHeight>
+        <InteractiveWidth>10.6in</InteractiveWidth>
+        <LeftMargin>.5in</LeftMargin>
+        <RightMargin>.5in</RightMargin>
+        <TopMargin>.4in</TopMargin>
+        <BottomMargin>.4in</BottomMargin>
+        <Style>
+          <BackgroundColor>White</BackgroundColor>
+        </Style>
+      </Page>
+    </ReportSection>
+  </ReportSections>
+  <ReportParameters>
+    <ReportParameter Name="pConnectionString">
+      <DataType>String</DataType>
+      <AllowBlank>true</AllowBlank>
+      <DefaultValue>
+        <Values>
+          <Value/>
+        </Values>
+      </DefaultValue>
+      <Prompt>pConnectionString</Prompt>
+      <Hidden>true</Hidden>
+    </ReportParameter>
+    <ReportParameter Name="pReportName">
+      <DataType>String</DataType>
+      <DefaultValue>
+        <Values>
+          <Value>Project Invoice Template Assignment Export</Value>
+        </Values>
+      </DefaultValue>
+      <Prompt>pReportName</Prompt>
+      <Hidden>true</Hidden>
+    </ReportParameter>
+  </ReportParameters>
+  <ReportParametersLayout>
+    <GridLayoutDefinition>
+      <NumberOfColumns>2</NumberOfColumns>
+      <NumberOfRows>1</NumberOfRows>
+      <CellDefinitions>
+        <CellDefinition>
+          <ColumnIndex>0</ColumnIndex>
+          <RowIndex>0</RowIndex>
+          <ParameterName>pConnectionString</ParameterName>
+        </CellDefinition>
+        <CellDefinition>
+          <ColumnIndex>1</ColumnIndex>
+          <RowIndex>0</RowIndex>
+          <ParameterName>pReportName</ParameterName>
+        </CellDefinition>
+      </CellDefinitions>
+    </GridLayoutDefinition>
+  </ReportParametersLayout>
+  <Language>en-US</Language>
+  <ConsumeContainerWhitespace>true</ConsumeContainerWhitespace>
+  <rd:ReportUnitType>Inch</rd:ReportUnitType>
+  <rd:ReportID>8a16251e-f1cf-47f4-b78c-6459338fd541</rd:ReportID>
+</Report>

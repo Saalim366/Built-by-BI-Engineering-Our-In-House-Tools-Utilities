@@ -1,6 +1,11 @@
 # RDL Diff — Offline Report Comparison
 
 Compare two versions of an SSRS RDL file to review changes to queries, expressions, parameters, layout, styles, and subreport references. Header, Body, Footer, and Report-level summaries help locate changes quickly.
+## Motivation
+Comparing an RDL file before and after modifications was a manual, time-consuming process. We had to run both report versions to check visual changes or open, format, and compare dataset queries separately.
+This tool simplifies that process by highlighting differences between two RDL files, making changes easier to review and validate.
+Future Enhancement
+
 
 **Tool:** `RDL_Diff_Offline_Header_Body_Footer.html`  
 **Edition:** Offline v1.1
@@ -122,3 +127,6 @@ Exported reports contain XML excerpts and values from the source files, which ma
 Generic XML can also be compared, but RDL area classification only applies to recognized Report structure; other XML is treated as Report-level.
 
 This tool compares report definitions. It does not render reports, execute SQL or expressions, validate RDL against an SSRS schema, merge files, or confirm business results. After reviewing a change, validate the revised report in Report Builder or CORE using suitable test data.
+
+## Future
+Add support for uploading ZIP files to compare multiple RDL files in a single operation. 
